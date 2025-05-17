@@ -1,0 +1,227 @@
+import numpy as np
+import gymnasium as gym
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+
+def build_NN(Nactions, Nobservations):
+    model = Sequential()
+    model.add(Dense(128, activation='relu', input_shape=(Nobservations,)))
+    model.add(Dense(Nactions))
+    return model
+
+def exploration_prob_scheduler(episode):
+    if episode<25:
+        return 0.5
+    elif episode<50:
+        return 0.4
+    elif episode<75:
+        return 0.3
+    elif episode<100:
+        return 0.2
+    else:
+        return 0.1
+
+def choose_action(x, model, Nactions, epsilon):
+    # Here model is the predict DQN. We have to use predict DQN to choose actions.    
+    if np.random.uniform()<epsilon:
+        action = np.random.randint(Nactions)   # Exploration
+    else:
+        Q_val = model.predict(np.expand_dims(x, axis=0), verbose=0)[0]
+        action = np.argmax(Q_val)              # Exploitation
+        
+    return action
+
+
+def add_to_buffer(x, a, r, x_dash, terminated, state_buffer, action_buffer, reward_buffer, next_state_buffer, terminated_buffer, buffer_size, buffer_counter, buffer_ix):        
+    state_buffer[buffer_ix] = x
+    action_buffer[buffer_ix] = a
+    reward_buffer[buffer_ix] = r
+    
+    if terminated:
+        next_state_buffer[buffer_ix] = np.zeros_like(x)  # If terminated=True, then the next_state is None. So, we fill the next state with dummy zero value.
+    else:
+        next_state_buffer[buffer_ix] = x_dash
+        
+    terminated_buffer[buffer_ix] = int(terminated) # If the episode terminated, then we save 1 or else 0.
+    
+    # buffer_counter is only updated till replay buffer is full. After that
+    # the number of sample in replay buffer is equal to buffer_size. Hence,
+    # no update required.
+    if buffer_counter<buffer_size:
+        buffer_counter+=1
+    
+    # Cyclic update of buffer_ix as mentioned in DQN_training() function.
+    buffer_ix+=1
+    if buffer_ix==buffer_size:
+        buffer_ix = 0
+        
+    return buffer_counter, buffer_ix
+
+
+def generate_training_data(state_buffer, action_buffer, reward_buffer, next_state_buffer, terminated_buffer, buffer_counter, model_predict, model_target, Nb, beta):
+    
+    # Sample a random batch from replay buffer. Line 12 of psuedocode.
+    ix = np.arange(buffer_counter)
+    np.random.shuffle(ix)
+    state_batch = state_buffer[ix[:Nb]]
+    action_batch = action_buffer[ix[:Nb]]
+    reward_batch = reward_buffer[ix[:Nb]]
+    next_state_batch = next_state_buffer[ix[:Nb]]
+    terminated_batch = terminated_buffer[ix[:Nb]]
+    
+    # The remaining line in this function generates the training batch using the
+    # samples obtained from replay buffer. Line 13 of psuedocode.
+    
+    # Generate input, X, and target, y, of the training data
+    X = state_batch # For architecture 2, the state is the only input.
+    
+    # This line creates dummy target values using predict DQN (refer to notes.pdf in this folder)
+    y = model_predict.predict(X, verbose=0)
+    
+    # These two lines create target values for the relevant actions.
+    # It is quite complex to explain it in writting. Essentially, the line
+    # y[np.arange(Nb), action_batch] is indexing of Numpy array, y, to assign
+    # the target value.
+    Q_next = np.max(model_target.predict(next_state_batch, verbose=0), axis=-1) #Using target DQN to generate the target.
+    y[np.arange(Nb), action_batch] = reward_batch + beta*Q_next*(1-terminated_batch) #(1-terminated) = 0 if terminated=1, implying no future reward.
+    
+    return X, y
+
+
+def DQN_training(env):
+    
+    # Training parameters. Similar to line 3 of the psuedocode.
+    Nu = 1               # Predict DQN training interval.
+    Nb = 100             # Training batch size.
+    Nt = 10              # Target DQN update interval.
+    beta = 0.99          # Discount factor.
+    Nepisodes = 100      # Number of episodes to train.
+    alpha = 0.001        # Learning rate. We are using a fixed learning rate.
+                         # Even though theory demand decaying learning rate,
+                         # in practice, fixed learning rate is used.
+    Nsave = 50           # How often to save the model.
+    buffer_size = 50000  # Replay buffer size.
+    Nactions = 2         # There are only two actions in action space in cartpole environment.
+    Nobservations = 4    # Dimension of the observation space of the cartpole environment.
+    
+
+    
+    # Build predict and target DQNs. Similar to line 1 of the psuedocode.
+    model_predict = build_NN(Nactions, Nobservations)
+    model_target = build_NN(Nactions, Nobservations)
+    model_target.set_weights(model_predict.get_weights())  # Copying predict DQN's weight to target DQN
+    
+    optimizer = Adam(learning_rate = alpha)
+    model_predict.compile(loss='mse', optimizer=optimizer)
+    # NOTE: We don't need to compile the target DQN because we are NOT training
+    #       it. We are simply copying the weights from predict DQN to target DQN.
+    
+    
+    # Initializing the replay buffer. Similar to line 2 of the psuedocode.
+    state_buffer = np.zeros((buffer_size, Nobservations))
+    action_buffer = np.zeros((buffer_size), dtype=np.uint8)     # Action indices and not the actual action
+    reward_buffer = np.zeros((buffer_size))
+    next_state_buffer = np.zeros((buffer_size, Nobservations))
+    terminated_buffer = np.zeros((buffer_size), dtype=np.uint8)  # This is required to detect end of episode    
+    
+    buffer_counter = 0        # Buffer counter represents how many samples are ther in the buffer.
+                              # Once the buffer is full buffer_counter will be always equal to
+                              # buffer_size.
+    
+    buffer_ix = 0             # Indicates the index in replay buffer where
+                              # new samples can be inserted. buffer_ix gets updated
+                              # in a cyclic fashion:
+                              # 0, 1,....,buffer_size-1,0,1,...
+                              #                         |
+                              #                        Again reset to zero to immitate a FIFO queue.
+    
+    # Initlializing counters for various periodic operations like saving predict DQN,
+    # update target DQN, and training predict DQN. Unlike psuedocode, we are using
+    # seperate counters for each operation. This is better because in the psuedocode
+    # the counter variable will always keep increasing and may gwt outside of the
+    # range if int. Here, we use counter variable in a cyclical fashion.
+    counter_save = 0
+    counter_target = 0
+    counter_predict = 0
+    
+    total_reward_per_episode = [] # This list will contain the total reward of every episode.
+
+    # Training starts here
+    for episode in range(Nepisodes):
+        # Set the exploration probability for the current episode. Similar to line 6 of psuedocode.
+        # NOTE:  Scheduling exploration probability, episilon, can be done various ways.
+        #        Here we are doing it in the beginning of an episode. Another alternative is to
+        #        do it after predict DQN tarining.
+        epsilon = exploration_prob_scheduler(episode)
+        
+        x,_ = env.reset() # Reset the environment to get the initial state. 
+                          # Similar to line 5 of psuedocode.
+        
+        total_reward = 0
+        end_episode = False
+        k = 0
+        while not(end_episode):
+            # Picking action. We MUST use predict DQN for picking the actions.
+            # Line 8 of the psuedocode.
+            a = choose_action(x, model_predict, Nactions, epsilon)
+            
+            # Taking action. Line 9 of the psuedocode.
+            x_dash, r, terminated, truncated, _ = env.step(a)
+            total_reward += r
+            
+            # Adding the generated sample to replay buffer
+            # Line 10 of the psuedocode.
+            buffer_counter, buffer_ix = add_to_buffer(x, a, r, x_dash, terminated, state_buffer, action_buffer, reward_buffer, next_state_buffer, terminated_buffer, buffer_size, buffer_counter, buffer_ix)
+                
+            # Peridically train predict network
+            counter_predict+=1
+            if counter_predict==Nu:
+                if buffer_counter>=Nb: # Only update DQN when there number of samples in the replay buffer is greater than the batch size.
+                    # This line generate the training batch. Lines 12 and 13 of psuedocode.
+                    # We will be using the target DQN to generate the target as mentioned in the psuedocode.
+                    # Yet, we are sending model_predict as well. To understand this, refer to notes.pdf that
+                    # is there in this folder. In order to generate dummy targets for actions that are not
+                    # relevant for a sample, we need need the predict DQN.
+                    X, y = generate_training_data(state_buffer, action_buffer, reward_buffer, next_state_buffer, terminated_buffer, buffer_counter, model_predict, model_target, Nb, beta)
+                    
+                    # Train predict DQN. Line 14 of the psuedocode.
+                    model_predict.train_on_batch(X, y) # Training the predict network
+
+                counter_predict = 0
+
+                # Periodically update target network. Similar to lines 15 and 16 of the psuedocode.
+                # We update the target DQN every Nt update of the predict DQN.
+                counter_target+=1            
+                if counter_target==Nt:
+                    model_target.set_weights(model_predict.get_weights())
+                    counter_target = 0
+                
+                # Periodically save the model
+                # We save the predict DQN every Nsave update of the predict DQN.
+                # We don't need to same target DQN because it is only used for
+                # generating targets. Predict DQN is the one that contains the policy.
+                counter_save+=1
+                if counter_save==Nsave:
+                    model_predict.save('cartpole_model.h5')
+                    counter_save = 0
+            
+            x = np.copy(x_dash)  # Line 17 of the psuedocode.          
+            k+=1
+            
+            if k>450 or terminated or truncated:
+                end_episode = True
+                
+        total_reward_per_episode.append(total_reward)
+        
+        print('Episode = {}, Total reward = {}, Epsilon = {}'.format(episode+1, np.round(total_reward, 2),  epsilon))
+        
+    return model_predict, np.array(total_reward_per_episode)
+
+
+env = gym.make('CartPole-v1')
+model, total_reward_per_episode = DQN_training(env)
+model.save('cartpole_model.h5')
+
+env.close()
